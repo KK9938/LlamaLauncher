@@ -17,11 +17,11 @@
 
 | 文件 | 说明 |
 |---|---|
+| `LlamaLauncher.exe` | 可单独运行的文件启动器 |
 | `llama_launcher.py` | 启动器源代码 |
 | `launcher.ico` | 程序图标 |
 | `build_exe.bat` | PyInstaller 打包脚本 |
-| `Llama一键启动_优化.bat` | 批处理备用启动方式 |
-| `Llama一键启动.ahk` | AutoHotkey 备用版本 |
+| `llama_letter2.png` | 图标原图 |
 
 ## 运行要求
 
