@@ -27,6 +27,16 @@ else:
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 LOG_DIR = os.path.join(APP_DIR, "logs")
+ICON_NAME = "launcher.ico"
+
+
+def resource_path(name):
+    """打包后从 _MEIPASS 取资源，未打包时从脚本目录取"""
+    base = getattr(sys, "_MEIPASS", APP_DIR)
+    p = os.path.join(base, name)
+    if os.path.isfile(p):
+        return p
+    return os.path.join(APP_DIR, name)
 
 DEFAULT_CONFIG = {
     "llama_server": r"D:\llama.cpp\llama-server.exe",
@@ -88,12 +98,44 @@ def rounded_rect(canvas, x1, y1, x2, y2, r, fill, outline="", width=0):
     return canvas.create_polygon(pts, fill=fill, outline=outline, width=width, smooth=True)
 
 
+# ===================== 自动扫描范围 =====================
+# 默认只扫描启动器所在的当前文件夹（exe/py 文件所在目录）。
+# 如需额外扫描其它目录，把绝对路径加进这个列表即可，例如：
+#   EXTRA_SCAN_DIRS = [r"D:\llama.cpp"]
+EXTRA_SCAN_DIRS = []
+
+# 遇到这些目录一律跳过（Windows 受保护目录，读取会抛 PermissionError）
+SKIP_DIRS = {
+    "System Volume Information", "$RECYCLE.BIN", "Recovery", "$WINDOWS.~BT",
+    "Windows", "Program Files", "Program Files (x86)", "ProgramData",
+}
+
+
+def safe_listdir(path):
+    """列目录，任何权限/不存在/系统保护错误都返回空列表，绝不抛异常"""
+    try:
+        return os.listdir(path)
+    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+        return []
+
+
+def safe_isdir(path):
+    try:
+        return os.path.isdir(path)
+    except OSError:
+        return False
+
+
 def find_candidates():
-    roots = []
-    for base in (APP_DIR, os.path.dirname(APP_DIR), os.getcwd()):
-        roots.extend([base, os.path.join(base, "llama.cpp")])
-    roots.extend([r"D:\llama.cpp", r"C:\llama.cpp", r"E:\llama.cpp"])
-    return [os.path.abspath(p) for p in roots]
+    """扫描范围：仅启动器所在文件夹 + EXTRA_SCAN_DIRS 中手动指定的目录"""
+    roots = [APP_DIR] + [p for p in EXTRA_SCAN_DIRS if p]
+    seen, out = set(), []
+    for p in roots:
+        ap = os.path.abspath(p)
+        if ap not in seen and safe_isdir(ap):
+            seen.add(ap)
+            out.append(ap)
+    return out
 
 
 def find_exe(name):
@@ -105,25 +147,31 @@ def find_exe(name):
 
 
 def pick_model_subdir(models_dir):
-    if not os.path.isdir(models_dir):
+    """在给定目录内找模型目录：自身有 gguf 就用自身，否则看一层子目录"""
+    if not safe_isdir(models_dir):
         return None
-    subs = [os.path.join(models_dir, d) for d in os.listdir(models_dir) if os.path.isdir(os.path.join(models_dir, d))]
-    valid = [s for s in subs if any(f.lower().endswith(".gguf") for f in os.listdir(s))]
+    names = safe_listdir(models_dir)
+    if any(f.lower().endswith(".gguf") for f in names):
+        return models_dir
+    valid = []
+    for d in names:
+        sub = os.path.join(models_dir, d)
+        if d in SKIP_DIRS or not safe_isdir(sub):
+            continue
+        if any(f.lower().endswith(".gguf") for f in safe_listdir(sub)):
+            valid.append(sub)
     if len(valid) == 1:
         return valid[0]
     if len(valid) > 1:
-        return models_dir
-    if any(f.lower().endswith(".gguf") for f in os.listdir(models_dir)):
         return models_dir
     return None
 
 
 def find_model_folder():
     for root in find_candidates():
-        if os.path.isdir(root):
-            picked = pick_model_subdir(root)
-            if picked:
-                return picked
+        picked = pick_model_subdir(root)
+        if picked:
+            return picked
     return None
 
 
@@ -275,6 +323,10 @@ class LlamaLauncher:
 
     def _build_window(self):
         self.root.title("Llama 一键启动器")
+        try:
+            self.root.iconbitmap(resource_path(ICON_NAME))
+        except Exception:
+            pass
         self.root.geometry(f"{W}x{H}")
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -293,6 +345,7 @@ class LlamaLauncher:
 
         self.canvas.bind("<Button-1>", self._start_drag)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.root.bind("<Map>", self._on_restore)
 
     def _bind_drag(self, widget):
         widget.bind("<Button-1>", self._start_drag)
@@ -305,6 +358,34 @@ class LlamaLauncher:
         if e.y < 50:
             self._drag["x"] = e.x_root - self.root.winfo_x()
             self._drag["y"] = e.y_root - self.root.winfo_y()
+
+    def _set_frameless(self):
+        """恢复无边框 + 透明色（overrideredirect 切换后 -transparentcolor 会被重置）"""
+        self.root.overrideredirect(True)
+        self.root.wm_attributes("-transparentcolor", "magenta")
+        self.root.config(bg="magenta")
+
+    def _minimize(self):
+        """最小化到任务栏。
+
+        无边框窗口（overrideredirect=True）无法直接 iconify，Tcl 会抛
+        "can't iconify: override-redirect flag is set"，打包成 --windowed 后
+        错误看不到，表现就是"点了没反应"。故先临时恢复系统边框再最小化，
+        窗口从任务栏恢复时（<Map> 事件）再改回无边框。
+        """
+        self.root.overrideredirect(False)
+        try:
+            self.root.iconify()
+        except Exception:
+            self._set_frameless()
+
+    def _on_restore(self, event=None):
+        if self._closing or self.root.state() == "iconic":
+            return
+        if self.root.overrideredirect():
+            return
+        self._set_frameless()
+        self.root.deiconify()
 
     def _on_drag(self, e):
         if e.y < 50:
@@ -325,7 +406,7 @@ class LlamaLauncher:
         min_lbl.pack(side="left", padx=8)
         min_lbl.bind("<Enter>", lambda e: min_lbl.config(fg=self.theme["text"]))
         min_lbl.bind("<Leave>", lambda e: min_lbl.config(fg=self.theme["muted"]))
-        min_lbl.bind("<Button-1>", lambda e: (self.root.iconify(), "break")[1])
+        min_lbl.bind("<Button-1>", lambda e: self._minimize())
         close_lbl = Label(ctrl, text="×", font=("Microsoft YaHei UI", 14, "bold"), bg=self.theme["bg"], fg=self.theme["muted"], cursor="hand2")
         close_lbl.pack(side="left", padx=(8, 0))
         close_lbl.bind("<Enter>", lambda e: close_lbl.config(fg=self.theme["danger"]))
@@ -502,7 +583,7 @@ class LlamaLauncher:
         folder = filedialog.askdirectory(title="选择模型文件夹（包含 .gguf 的目录）")
         if not folder:
             return
-        if not any(f.lower().endswith(".gguf") for f in os.listdir(folder)):
+        if not any(f.lower().endswith(".gguf") for f in safe_listdir(folder)):
             if not messagebox.askyesno("确认", "该目录下没有 .gguf 文件，确定要选择它吗？"):
                 return
         self.cfg["model_folder"] = folder
@@ -523,7 +604,7 @@ class LlamaLauncher:
         if not os.path.isdir(folder):
             self._log(f"模型文件夹不存在: {folder}", "err")
             return
-        ggufs = [f for f in os.listdir(folder) if f.lower().endswith(".gguf") and os.path.isfile(os.path.join(folder, f))]
+        ggufs = [f for f in safe_listdir(folder) if f.lower().endswith(".gguf") and os.path.isfile(os.path.join(folder, f))]
         skipped = sum(1 for f in ggufs if f.lower().startswith("mmproj"))
         self.models = sorted(os.path.join(folder, f) for f in ggufs if not f.lower().startswith("mmproj"))
         if not self.models:
